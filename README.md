@@ -4,7 +4,7 @@ This project replaces the local Python bridge with a Cloudflare Worker + SQLite-
 
 **You do not need to run `wrangler login` or deploy from your own terminal.** Use the Cloudflare dashboard's GitHub integration to build and deploy the Worker. Cloudflare Workers Builds runs the deploy command for you.
 
-## What the project contains
+## What the project contain
 
 - `cloudflare/`: Worker API, Durable Object scheduler, and `wrangler.toml` configuration.
 - `node/`: headless Chromium + Playwright browser node and Dockerfile.
