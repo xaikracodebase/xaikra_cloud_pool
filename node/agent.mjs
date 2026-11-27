@@ -71,33 +71,91 @@ function send(message) {
 // OUTBOUND IPV4 CONNECTIVITY DIAGNOSTICS
 // ============================================================
 
+
 async function networkDiagnostics() {
   const hostname = "brunhild.challenges.cloudflare.com";
 
-  const candidateIPv4 = [
+  const candidates = [
     "104.18.16.146",
-    "104.18.17.146",
+    "104.18.17.146"
   ];
 
-  log("========== FORCED IPV4 CONNECTIVITY TEST BEGIN ==========");
-
-  let actualIPv4 = [];
+  log("========== CORRECTED IPV4 TEST BEGIN ==========");
 
   try {
-    actualIPv4 = await dns.resolve4(hostname);
-
-    log(
-      "[ACTUAL IPV4 DNS RECORDS]",
-      hostname,
-      JSON.stringify(actualIPv4)
-    );
+    const records = await dns.resolve4(hostname);
+    log("[ACTUAL IPV4 DNS]", JSON.stringify(records));
   } catch (error) {
-    log(
-      "[NO IPV4 DNS RECORDS]",
-      hostname,
-      error.code || errorText(error)
-    );
+    log("[ACTUAL IPV4 DNS]", error.code || error.message);
   }
+
+  for (const ip of candidates) {
+    await new Promise(resolve => {
+      let finished = false;
+
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        resolve();
+      };
+
+      log("[TESTING]", hostname, "via", ip);
+
+      const req = https.get({
+        hostname,
+        servername: hostname,
+        path: "/",
+        family: 4,
+        autoSelectFamily: false,
+        timeout: 10000,
+
+        lookup: (_hostname, options, callback) => {
+          if (typeof options === "function") {
+            callback = options;
+            options = {};
+          }
+
+          if (options?.all) {
+            callback(null, [
+              { address: ip, family: 4 }
+            ]);
+          } else {
+            callback(null, ip, 4);
+          }
+        }
+      }, response => {
+        log(
+          "[IPV4 RESULT]",
+          ip,
+          "HTTP",
+          response.statusCode
+        );
+
+        response.resume();
+        response.on("end", finish);
+        response.on("error", finish);
+      });
+
+      req.on("timeout", () => {
+        log("[IPV4 TIMEOUT]", ip);
+        req.destroy();
+        finish();
+      });
+
+      req.on("error", error => {
+        log(
+          "[IPV4 ERROR]",
+          ip,
+          error.code || error.message
+        );
+        finish();
+      });
+    });
+  }
+
+  log("========== CORRECTED IPV4 TEST END ==========");
+}
+
 
   // Test actual A records first, then candidate IPv4 endpoints
   // inferred from the IPv6 addresses observed previously.
