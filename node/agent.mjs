@@ -4,6 +4,10 @@ import WebSocket from "ws";
 import fs from "node:fs/promises";
 import os from "node:os";
 
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
 const PERCHANCE_URL =
   process.env.PERCHANCE_URL || "https://perchance.org/fu677q3rr4";
 
@@ -23,6 +27,7 @@ const ACCEPT_PERCHANCE_WARNING =
   process.env.ACCEPT_PERCHANCE_WARNING === "true";
 
 const HEARTBEAT_MS = 25_000;
+const API_DISCOVERY_TIMEOUT_MS = 180_000;
 const MAX_IMAGE_DATA_URL_CHARS = 6_000_000;
 
 const WARNING_ACTION_RE =
@@ -30,6 +35,16 @@ const WARNING_ACTION_RE =
 
 if (!CF_WS_URL || !NODE_TOKEN) {
   console.error("Missing CF_WS_URL or NODE_TOKEN environment variable.");
+  process.exit(1);
+}
+
+if (!Number.isInteger(TEXT_SLOTS) || TEXT_SLOTS < 0 || TEXT_SLOTS > 4) {
+  console.error("TEXT_SLOTS must be an integer from 0 to 4.");
+  process.exit(1);
+}
+
+if (!Number.isInteger(IMAGE_SLOTS) || IMAGE_SLOTS < 0 || IMAGE_SLOTS > 2) {
+  console.error("IMAGE_SLOTS must be an integer from 0 to 2.");
   process.exit(1);
 }
 
@@ -44,22 +59,187 @@ function log(...args) {
   console.log(new Date().toISOString(), "[node]", ...args);
 }
 
+function errorText(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function send(message) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    return false;
-  }
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
 
   try {
     socket.send(JSON.stringify(message));
     return true;
   } catch (error) {
-    log("WebSocket send failed:", error.message);
+    log("WebSocket send failed:", errorText(error));
     return false;
   }
 }
 
 // ============================================================
-// PERCHANCE WARNING DETECTION
+// PAGE / NETWORK DIAGNOSTICS
+// ============================================================
+
+function attachPageDiagnostics(page) {
+  page.on("request", (request) => {
+    try {
+      if (
+        request.isNavigationRequest() &&
+        request.resourceType() === "document"
+      ) {
+        let frameUrl = "unknown";
+
+        try {
+          frameUrl = request.frame().url();
+        } catch {}
+
+        log(
+          "[DOCUMENT REQUEST]",
+          request.url(),
+          "frame-before-nav=",
+          frameUrl
+        );
+      }
+    } catch {}
+  });
+
+  page.on("requestfailed", (request) => {
+    let frameUrl = "unknown";
+
+    try {
+      frameUrl = request.frame().url();
+    } catch {}
+
+    let failure = "unknown network error";
+
+    try {
+      failure = request.failure()?.errorText || failure;
+    } catch {}
+
+    log(
+      "[REQUEST FAILED]",
+      "type=", request.resourceType(),
+      "method=", request.method(),
+      "url=", request.url(),
+      "frame=", frameUrl,
+      "error=", failure
+    );
+  });
+
+  page.on("response", (response) => {
+    if (response.status() < 400) return;
+
+    const request = response.request();
+
+    if (
+      request.resourceType() === "document" ||
+      /perchance\.org|challenges\.cloudflare\.com/i.test(response.url())
+    ) {
+      log(
+        "[HTTP ERROR]",
+        response.status(),
+        "type=", request.resourceType(),
+        "url=", response.url()
+      );
+    }
+  });
+
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      log("[BROWSER CONSOLE ERROR]", message.text());
+    }
+  });
+
+  page.on("pageerror", (error) => {
+    log("[PAGE JAVASCRIPT ERROR]", errorText(error));
+  });
+
+  page.on("frameattached", (frame) => {
+    log("[FRAME ATTACHED]", frame.url() || "<pending URL>");
+  });
+
+  page.on("framenavigated", (frame) => {
+    let frameName = "";
+
+    try {
+      frameName = frame.name();
+    } catch {}
+
+    log("[FRAME NAVIGATED]", "name=", frameName, "url=", frame.url());
+  });
+
+  page.on("framedetached", (frame) => {
+    let oldUrl = "unknown";
+
+    try {
+      oldUrl = frame.url();
+    } catch {}
+
+    log("[FRAME DETACHED]", oldUrl);
+  });
+
+  page.on("crash", () => {
+    log("[PAGE CRASHED] Perchance page crashed; closing node socket.");
+
+    try {
+      socket?.close(1012, "Perchance page crashed");
+    } catch {}
+  });
+}
+
+async function dumpPageDiagnostics(page, label) {
+  log(`========== ${label}: PAGE SNAPSHOT BEGIN ==========`);
+
+  try {
+    const pageInfo = await page.evaluate(() => ({
+      url: location.href,
+      title: document.title,
+      readyState: document.readyState,
+      bodyText: document.body?.innerText?.slice(0, 1200) || "",
+
+      iframes: Array.from(document.querySelectorAll("iframe")).map(
+        (frame) => ({
+          srcAttribute: frame.getAttribute("src"),
+          resolvedSrc: frame.src,
+          title: frame.title,
+          name: frame.name,
+          id: frame.id,
+          sandbox: frame.getAttribute("sandbox")
+        })
+      )
+    }));
+
+    log("[PAGE SNAPSHOT]", JSON.stringify(pageInfo));
+  } catch (error) {
+    log("[PAGE SNAPSHOT FAILED]", errorText(error));
+  }
+
+  for (const [index, frame] of page.frames().entries()) {
+    try {
+      const details = await frame.evaluate(() => ({
+        url: location.href,
+        title: document.title,
+        readyState: document.readyState,
+        rootType: typeof window.root,
+        generateText: typeof window.root?.generateText,
+        generateImage: typeof window.root?.generateImage,
+        bodyText: document.body?.innerText?.slice(0, 700) || ""
+      }));
+
+      log(`[FRAME SNAPSHOT ${index}]`, JSON.stringify(details));
+    } catch (error) {
+      log(
+        `[FRAME SNAPSHOT ${index} FAILED]`,
+        frame.url(),
+        errorText(error)
+      );
+    }
+  }
+
+  log(`========== ${label}: PAGE SNAPSHOT END ==========`);
+}
+
+// ============================================================
+// PERCHANCE CONTENT CONFIRMATION
 // ============================================================
 
 async function findPerchanceWarningAction(page, timeoutMs = 10_000) {
@@ -107,13 +287,9 @@ async function findPerchanceWarningAction(page, timeoutMs = 10_000) {
                 locator: candidate
               };
             }
-          } catch {
-            // Frame may disappear during navigation.
-          }
+          } catch {}
         }
-      } catch {
-        // Ignore inaccessible or detached frames.
-      }
+      } catch {}
     }
 
     await page.waitForTimeout(300).catch(() => {});
@@ -132,13 +308,13 @@ async function continuePastPerchanceWarning(page) {
 
   if (!ACCEPT_PERCHANCE_WARNING) {
     throw new Error(
-      "Perchance is showing a content/age confirmation. " +
-      "Set ACCEPT_PERCHANCE_WARNING=true only if you are " +
-      "legally permitted to view the page and choose to accept."
+      "Perchance is showing a content/age confirmation. Set " +
+      "ACCEPT_PERCHANCE_WARNING=true only if you are legally permitted " +
+      "to view the page and choose to accept the confirmation."
     );
   }
 
-  log("Perchance continuation warning detected.");
+  log("Perchance continuation warning detected; clicking the visible confirmation.");
 
   await action.locator.click({
     timeout: 15_000
@@ -150,10 +326,41 @@ async function continuePastPerchanceWarning(page) {
 }
 
 // ============================================================
-// GENERATOR API DISCOVERY
+// GENERATOR FRAME DISCOVERY
 // ============================================================
 
-async function locateGeneratorFrame(page, timeoutMs = 180_000) {
+async function inspectFrameForGenerator(frame) {
+  return frame.evaluate(() => {
+    let api = window.root;
+
+    if (!api) {
+      try {
+        api = window.eval(
+          "typeof root !== 'undefined' ? root : null"
+        );
+      } catch {}
+    }
+
+    return {
+      url: location.href,
+      title: document.title,
+      readyState: document.readyState,
+      rootType: typeof api,
+      generateText: typeof api?.generateText,
+      generateImage: typeof api?.generateImage,
+      bodyText: document.body?.innerText?.slice(0, 500) || "",
+
+      hasGeneratorApi:
+        typeof api?.generateText === "function" &&
+        typeof api?.generateImage === "function"
+    };
+  });
+}
+
+async function locateGeneratorFrame(
+  page,
+  timeoutMs = API_DISCOVERY_TIMEOUT_MS
+) {
   const deadline = Date.now() + timeoutMs;
 
   let nextDiagnosticAt = 0;
@@ -161,45 +368,50 @@ async function locateGeneratorFrame(page, timeoutMs = 180_000) {
   while (Date.now() < deadline) {
     for (const frame of page.frames()) {
       try {
-        const ready = await frame.evaluate(() => {
-          let api = window.root;
+        const info = await inspectFrameForGenerator(frame);
 
-          if (!api) {
-            try {
-              api = window.eval(
-                "typeof root !== 'undefined' ? root : null"
-              );
-            } catch {}
-          }
-
-          return Boolean(
-            api &&
-            typeof api.generateText === "function" &&
-            typeof api.generateImage === "function"
-          );
-        });
-
-        if (ready) {
+        if (info.hasGeneratorApi) {
+          log("[GENERATOR API FOUND]", JSON.stringify(info));
           return frame;
         }
       } catch {
-        // Frame may be navigating.
+        // A frame can be navigating or detached.
       }
     }
 
     if (Date.now() >= nextDiagnosticAt) {
-      const frameUrls = page.frames().map((frame) => {
+      const frameSummary = [];
+
+      for (const frame of page.frames()) {
         try {
-          return frame.url();
-        } catch {
-          return "<detached frame>";
+          frameSummary.push(
+            await inspectFrameForGenerator(frame)
+          );
+        } catch (error) {
+          frameSummary.push({
+            url: frame.url(),
+            inspectionError: errorText(error)
+          });
         }
-      });
+      }
 
       log(
-        "Still searching for the Perchance generation API. Frames:",
-        frameUrls
+        "[GENERATOR SEARCH SNAPSHOT]",
+        JSON.stringify(frameSummary)
       );
+
+      if (
+        frameSummary.some((f) =>
+          typeof f.url === "string" &&
+          f.url.includes("challenges.cloudflare.com")
+        )
+      ) {
+        log(
+          "[VERIFICATION NOTICE] A Cloudflare verification frame is present. " +
+          "This node does not solve or bypass verification. Use an approved " +
+          "interactive verification flow or contact the site operator about automation access."
+        );
+      }
 
       nextDiagnosticAt = Date.now() + 20_000;
     }
@@ -207,9 +419,15 @@ async function locateGeneratorFrame(page, timeoutMs = 180_000) {
     await page.waitForTimeout(1_000).catch(() => {});
   }
 
+  await dumpPageDiagnostics(
+    page,
+    "GENERATOR API DISCOVERY TIMEOUT"
+  );
+
   throw new Error(
-    "Could not find Perchance root.generateText/root.generateImage " +
-    "within 3 minutes. Check the page, browser verification and frames."
+    "Could not find root.generateText/root.generateImage within " +
+    `${Math.round(timeoutMs / 1000)} seconds. See PAGE SNAPSHOT, FRAME SNAPSHOT, ` +
+    "REQUEST FAILED and HTTP ERROR log entries for the exact iframe failure."
   );
 }
 
@@ -251,18 +469,17 @@ async function startBrowser() {
     browserContext.pages()[0] ||
     await browserContext.newPage();
 
+  attachPageDiagnostics(currentPage);
+
   await currentPage.exposeFunction(
     "__cloudflareEmitChunk",
     (payload) => {
       if (
         !payload ||
         typeof payload.taskId !== "string" ||
-        typeof payload.text !== "string"
+        typeof payload.text !== "string" ||
+        payload.text.length > 64_000
       ) {
-        return;
-      }
-
-      if (payload.text.length > 64_000) {
         return;
       }
 
@@ -274,14 +491,6 @@ async function startBrowser() {
     }
   );
 
-  currentPage.on("crash", () => {
-    log("Perchance page crashed.");
-
-    try {
-      socket?.close(1012, "Perchance page crashed");
-    } catch {}
-  });
-
   await currentPage.goto(PERCHANCE_URL, {
     waitUntil: "domcontentloaded",
     timeout: 120_000
@@ -290,6 +499,14 @@ async function startBrowser() {
   log("Opened", PERCHANCE_URL);
 
   await continuePastPerchanceWarning(currentPage);
+
+  await currentPage.waitForTimeout(2_500);
+
+  // Capture iframe src attributes and inspect every frame.
+  await dumpPageDiagnostics(
+    currentPage,
+    "POST-WARNING DIAGNOSTIC"
+  );
 
   generatorFrame = await locateGeneratorFrame(currentPage);
 
@@ -304,7 +521,11 @@ async function startBrowser() {
 // ============================================================
 
 async function runJob(job) {
-  if (activeJobs.has(job.taskId)) {
+  if (
+    !job ||
+    typeof job.taskId !== "string" ||
+    activeJobs.has(job.taskId)
+  ) {
     return;
   }
 
@@ -339,9 +560,7 @@ async function runJob(job) {
         }
 
         if (!api) {
-          throw new Error(
-            "Perchance root API disappeared."
-          );
+          throw new Error("Perchance root API disappeared.");
         }
 
         // IMAGE GENERATION
@@ -446,7 +665,7 @@ async function runJob(job) {
       result.response.length > MAX_IMAGE_DATA_URL_CHARS
     ) {
       throw new Error(
-        "Image result is too large for the configured Cloudflare WebSocket payload limit."
+        "Image result exceeds the configured 6 MB Cloudflare storage limit."
       );
     }
 
@@ -456,15 +675,20 @@ async function runJob(job) {
       response: result.response
     });
 
-    log("Job completed:", job.taskId, job.mode);
+    log(
+      "Job completed:",
+      job.taskId,
+      job.mode
+    );
 
   } catch (error) {
-    const message =
-      error instanceof Error
-        ? error.message
-        : String(error);
+    const message = errorText(error);
 
-    log("Job failed:", job.taskId, message);
+    log(
+      "Job failed:",
+      job.taskId,
+      message
+    );
 
     send({
       type: "error",
@@ -519,6 +743,7 @@ function openCloudflareSocket() {
       try {
         message = JSON.parse(raw);
       } catch {
+        log("Ignoring non-JSON Cloudflare message.");
         return;
       }
 
@@ -532,7 +757,10 @@ function openCloudflareSocket() {
           imageSlots: IMAGE_SLOTS
         }));
 
-      } else if (message.type === "node_ready") {
+        return;
+      }
+
+      if (message.type === "node_ready") {
         log(
           "Registered with Cloudflare:",
           message
@@ -543,10 +771,15 @@ function openCloudflareSocket() {
           resolve(ws);
         }
 
-      } else if (message.type === "job") {
-        void runJob(message);
+        return;
+      }
 
-      } else if (message.type === "error") {
+      if (message.type === "job") {
+        void runJob(message);
+        return;
+      }
+
+      if (message.type === "error") {
         log("Cloudflare error:", message.error);
 
         if (!settled) {
@@ -598,6 +831,8 @@ function openCloudflareSocket() {
 
 async function main() {
   while (true) {
+    let heartbeat;
+
     try {
       await startBrowser();
 
@@ -607,7 +842,7 @@ async function main() {
         `Node online. Capacity: ${TEXT_SLOTS} text + ${IMAGE_SLOTS} image.`
       );
 
-      const heartbeat = setInterval(() => {
+      heartbeat = setInterval(() => {
         if (socket?.readyState === WebSocket.OPEN) {
           socket.send("ping");
         }
@@ -619,36 +854,39 @@ async function main() {
         currentPage.once("crash", resolve);
       });
 
-      clearInterval(heartbeat);
-
     } catch (error) {
       log(
         "Node cycle ended:",
-        error.message || error
+        errorText(error)
       );
+
+    } finally {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
+
+      try {
+        socket?.terminate();
+      } catch {}
+
+      try {
+        await browserContext?.close();
+      } catch {}
+
+      socket = null;
+      browserContext = null;
+      currentPage = null;
+      generatorFrame = null;
+
+      activeJobs.clear();
     }
-
-    try {
-      socket?.terminate();
-    } catch {}
-
-    try {
-      await browserContext?.close();
-    } catch {}
-
-    socket = null;
-    browserContext = null;
-    currentPage = null;
-    generatorFrame = null;
-
-    activeJobs.clear();
 
     log(
       "Restarting browser/node connection in 5 seconds."
     );
 
     await new Promise((resolve) =>
-      setTimeout(resolve, 5000)
+      setTimeout(resolve, 5_000)
     );
   }
 }
@@ -672,6 +910,6 @@ process.on("SIGTERM", async () => {
 });
 
 main().catch((error) => {
-  log("Fatal node error:", error);
+  log("Fatal node error:", errorText(error));
   process.exit(1);
 });
