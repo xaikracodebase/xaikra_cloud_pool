@@ -1,6 +1,7 @@
 // node.js
-import { chromium } from "patchright"; // <-- Swapped from "playwright"
+import { chromium } from "patchright";
 import WebSocket from "ws";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import https from "node:https";
@@ -21,17 +22,19 @@ const TEXT_SLOTS = Number.parseInt(process.env.TEXT_SLOTS || "2", 10);
 const IMAGE_SLOTS = Number.parseInt(process.env.IMAGE_SLOTS || "1", 10);
 const ACCEPT_PERCHANCE_WARNING =
   process.env.ACCEPT_PERCHANCE_WARNING === "true";
+const CHROME_CHANNEL = process.env.CHROME_CHANNEL || undefined;
 
 // --- PROXY CONFIGURATION ---
-// A residential proxy is the most reliable way to bypass the network-level
-// block on *.challenges.cloudflare.com from datacenter IPs, and it also
-// improves IP reputation for Cloudflare's bot scoring.
-const PROXY_SERVER = process.env.PROXY_SERVER; // "http://host:port"
+const PROXY_SERVER = process.env.PROXY_SERVER; // e.g. "http://host:port" or "http://user:pass@host:port"
 const PROXY_USERNAME = process.env.PROXY_USERNAME;
 const PROXY_PASSWORD = process.env.PROXY_PASSWORD;
 
 const HEARTBEAT_MS = 25_000;
+const HEARTBEAT_TIMEOUT_MS = HEARTBEAT_MS * 3;
 const API_DISCOVERY_TIMEOUT_MS = 180_000;
+const JOB_TIMEOUT_MS = 300_000;
+const CHUNK_POLL_MS = 75;
+const MAX_CHUNK_CHARS = 64_000;
 const MAX_IMAGE_DATA_URL_CHARS = 6_000_000;
 const WARNING_ACTION_RE =
   /(?:continue\s+to\s+page|i['’]?m\s+over\s+18.*show\s+content)/i;
@@ -52,7 +55,9 @@ if (!Number.isInteger(IMAGE_SLOTS) || IMAGE_SLOTS < 0 || IMAGE_SLOTS > 2) {
 let browserContext;
 let currentPage;
 let generatorFrame;
+let frameRecoveryPromise = null;
 let socket;
+let lastPongAt = 0;
 const activeJobs = new Set();
 
 function log(...args) {
@@ -72,6 +77,32 @@ function send(message) {
     log("WebSocket send failed:", errorText(error));
     return false;
   }
+}
+
+function buildProxyConfig() {
+  if (!PROXY_SERVER) return undefined;
+
+  let server = PROXY_SERVER.trim();
+  let username = PROXY_USERNAME;
+  let password = PROXY_PASSWORD;
+
+  try {
+    const parsed = new URL(server);
+    if (parsed.username || parsed.password) {
+      if (!username) username = decodeURIComponent(parsed.username);
+      if (!password) password = decodeURIComponent(parsed.password);
+      parsed.username = "";
+      parsed.password = "";
+      server = parsed.toString().replace(/\/$/, "");
+    }
+  } catch {
+    // Keep raw server string (e.g. "host:port") if not a full URL
+  }
+
+  const config = { server };
+  if (username) config.username = username;
+  if (password) config.password = password;
+  return config;
 }
 
 // ============================================================
@@ -213,12 +244,6 @@ function attachPageDiagnostics(page) {
     }
   });
 
-  page.on("console", (message) => {
-    if (message.type() === "error") {
-      log("[BROWSER CONSOLE ERROR]", message.text());
-    }
-  });
-
   page.on("pageerror", (error) => {
     log("[PAGE JAVASCRIPT ERROR]", errorText(error));
   });
@@ -276,15 +301,28 @@ async function dumpPageDiagnostics(page, label) {
 
   for (const [index, frame] of page.frames().entries()) {
     try {
-      const details = await frame.evaluate(() => ({
-        url: location.href,
-        title: document.title,
-        readyState: document.readyState,
-        rootType: typeof window.root,
-        generateText: typeof window.root?.generateText,
-        generateImage: typeof window.root?.generateImage,
-        bodyText: document.body?.innerText?.slice(0, 700) || "",
-      }));
+      // Patchright defaults evaluate() to isolatedContext=true; pass false to inspect main-world root.
+      const details = await frame.evaluate(
+        () => {
+          let api = window.root;
+          if (!api) {
+            try {
+              api = (0, eval)("typeof root !== 'undefined' ? root : null");
+            } catch {}
+          }
+          return {
+            url: location.href,
+            title: document.title,
+            readyState: document.readyState,
+            rootType: typeof api,
+            generateText: typeof api?.generateText,
+            generateImage: typeof api?.generateImage,
+            bodyText: document.body?.innerText?.slice(0, 700) || "",
+          };
+        },
+        undefined,
+        false
+      );
       log(`[FRAME SNAPSHOT ${index}]`, JSON.stringify(details));
     } catch (error) {
       log(`[FRAME SNAPSHOT ${index} FAILED]`, frame.url(), errorText(error));
@@ -299,7 +337,7 @@ async function dumpPageDiagnostics(page, label) {
 
 async function findPerchanceWarningAction(page, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  do {
     for (const frame of page.frames()) {
       try {
         const candidates = [
@@ -319,24 +357,22 @@ async function findPerchanceWarningAction(page, timeoutMs = 10_000) {
         ];
         for (const candidate of candidates) {
           try {
-            if (await candidate.count() > 0 && await candidate.isVisible()) {
+            if ((await candidate.count()) > 0 && (await candidate.isVisible())) {
               return { frame, locator: candidate };
             }
           } catch {}
         }
       } catch {}
     }
-    await page.waitForTimeout(300).catch(() => {});
-  }
+    if (Date.now() < deadline) {
+      await page.waitForTimeout(300).catch(() => {});
+    }
+  } while (Date.now() < deadline);
+
   return null;
 }
 
-async function continuePastPerchanceWarning(page) {
-  const action = await findPerchanceWarningAction(page);
-  if (!action) {
-    log("No Perchance continuation warning detected.");
-    return;
-  }
+async function acceptWarningAction(page, action) {
   if (!ACCEPT_PERCHANCE_WARNING) {
     throw new Error(
       "Perchance is showing a content/age confirmation. Set " +
@@ -350,31 +386,47 @@ async function continuePastPerchanceWarning(page) {
   log("Perchance continuation action completed.");
 }
 
+async function continuePastPerchanceWarning(page, timeoutMs = 10_000) {
+  const action = await findPerchanceWarningAction(page, timeoutMs);
+  if (!action) {
+    log("No Perchance continuation warning detected.");
+    return false;
+  }
+  await acceptWarningAction(page, action);
+  return true;
+}
+
 // ============================================================
 // GENERATOR FRAME DISCOVERY
 // ============================================================
 
 async function inspectFrameForGenerator(frame) {
-  return frame.evaluate(() => {
-    let api = window.root;
-    if (!api) {
-      try {
-        api = window.eval("typeof root !== 'undefined' ? root : null");
-      } catch {}
-    }
-    return {
-      url: location.href,
-      title: document.title,
-      readyState: document.readyState,
-      rootType: typeof api,
-      generateText: typeof api?.generateText,
-      generateImage: typeof api?.generateImage,
-      bodyText: document.body?.innerText?.slice(0, 500) || "",
-      hasGeneratorApi:
-        typeof api?.generateText === "function" &&
-        typeof api?.generateImage === "function",
-    };
-  });
+  // IMPORTANT (Patchright): pass isolatedContext=false (3rd arg) so we run in the
+  // frame's Main World where Perchance defines `root` / `window.root`.
+  return frame.evaluate(
+    () => {
+      let api = window.root;
+      if (!api) {
+        try {
+          api = (0, eval)("typeof root !== 'undefined' ? root : null");
+        } catch {}
+      }
+      return {
+        url: location.href,
+        title: document.title,
+        readyState: document.readyState,
+        rootType: typeof api,
+        generateText: typeof api?.generateText,
+        generateImage: typeof api?.generateImage,
+        bodyText: document.body?.innerText?.slice(0, 500) || "",
+        hasGeneratorApi:
+          typeof api?.generateText === "function" &&
+          typeof api?.generateImage === "function",
+      };
+    },
+    undefined,
+    false
+  );
 }
 
 async function locateGeneratorFrame(page, timeoutMs = API_DISCOVERY_TIMEOUT_MS) {
@@ -392,6 +444,13 @@ async function locateGeneratorFrame(page, timeoutMs = API_DISCOVERY_TIMEOUT_MS) 
       } catch {}
     }
 
+    // Handle warnings that appear late (e.g. after Cloudflare challenge or slow proxy).
+    const lateWarning = await findPerchanceWarningAction(page, 0);
+    if (lateWarning) {
+      await acceptWarningAction(page, lateWarning);
+      continue;
+    }
+
     if (Date.now() >= nextDiagnosticAt) {
       const frameSummary = [];
       for (const frame of page.frames()) {
@@ -405,9 +464,13 @@ async function locateGeneratorFrame(page, timeoutMs = API_DISCOVERY_TIMEOUT_MS) 
         }
       }
       log("[GENERATOR SEARCH SNAPSHOT]", JSON.stringify(frameSummary));
-      if (frameSummary.some((f) =>
-        typeof f.url === "string" && f.url.includes("challenges.cloudflare.com")
-      )) {
+      if (
+        frameSummary.some(
+          (f) =>
+            typeof f.url === "string" &&
+            f.url.includes("challenges.cloudflare.com")
+        )
+      ) {
         log(
           "[VERIFICATION NOTICE] A Cloudflare verification frame is present. " +
           "This node does not solve or bypass verification. Use an approved " +
@@ -427,6 +490,21 @@ async function locateGeneratorFrame(page, timeoutMs = API_DISCOVERY_TIMEOUT_MS) 
   );
 }
 
+async function ensureGeneratorFrame() {
+  if (generatorFrame && !generatorFrame.isDetached()) {
+    return generatorFrame;
+  }
+  if (!frameRecoveryPromise) {
+    frameRecoveryPromise = locateGeneratorFrame(currentPage, 30_000).finally(
+      () => {
+        frameRecoveryPromise = null;
+      }
+    );
+  }
+  generatorFrame = await frameRecoveryPromise;
+  return generatorFrame;
+}
+
 // ============================================================
 // START STEALTH CHROMIUM (Patchright) UNDER XVFB
 // ============================================================
@@ -434,55 +512,36 @@ async function locateGeneratorFrame(page, timeoutMs = API_DISCOVERY_TIMEOUT_MS) 
 async function startBrowser() {
   await fs.mkdir(PROFILE_DIR, { recursive: true });
 
-  // Build proxy configuration if provided
-  let proxyConfig;
-  if (PROXY_SERVER) {
-    proxyConfig = { server: PROXY_SERVER };
-    if (PROXY_USERNAME) proxyConfig.username = PROXY_USERNAME;
-    if (PROXY_PASSWORD) proxyConfig.password = PROXY_PASSWORD;
-    log("Launching headed Patchright Chromium with proxy", PROXY_SERVER);
+  const proxyConfig = buildProxyConfig();
+  if (proxyConfig) {
+    log("Launching headed Patchright Chromium with proxy", proxyConfig.server);
   } else {
     log("Launching headed Patchright Chromium WITHOUT proxy (network may still block challenges)");
   }
   log("Profile directory:", PROFILE_DIR);
 
   browserContext = await chromium.launchPersistentContext(PROFILE_DIR, {
+    ...(CHROME_CHANNEL ? { channel: CHROME_CHANNEL } : {}),
     headless: false,
-    viewport: { width: 1365, height: 900 },
-    locale: "en-US",
+    viewport: null,
     proxy: proxyConfig,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
-      "--disable-gpu",
+      "--window-size=1365,900",
       // Force IPv4 to work around broken IPv6 routes in container networks.
       "--disable-ipv6",
-      // Reduce automation tells at the browser level.
-      "--disable-blink-features=AutomationControlled",
-      // Helpful stability on xvfb / containers
-      "--disable-features=IsolateOrigins,site-per-process",
     ],
   });
 
-  currentPage = browserContext.pages()[0] || await browserContext.newPage();
+  currentPage = browserContext.pages()[0] || (await browserContext.newPage());
   attachPageDiagnostics(currentPage);
 
-  await currentPage.exposeFunction("__cloudflareEmitChunk", (payload) => {
-    if (
-      !payload ||
-      typeof payload.taskId !== "string" ||
-      typeof payload.text !== "string" ||
-      payload.text.length > 64_000
-    ) {
-      return;
-    }
-    send({
-      type: "chunk",
-      taskId: payload.taskId,
-      text: payload.text,
-    });
-  });
+  // NOTE: Do NOT use currentPage.exposeFunction() in Patchright!
+  // Patchright's exposeFunction installs a global "**/*" Fetch route interceptor
+  // to inject bindings, which degrades stealth and interferes with Cloudflare/iframe docs.
+  // Instead, streaming chunks are polled directly from the frame's Main World.
 
   await currentPage.goto(PERCHANCE_URL, {
     waitUntil: "domcontentloaded",
@@ -490,7 +549,7 @@ async function startBrowser() {
   });
   log("Opened", PERCHANCE_URL);
 
-  await continuePastPerchanceWarning(currentPage);
+  await continuePastPerchanceWarning(currentPage, 10_000);
   await currentPage.waitForTimeout(2_500);
   await dumpPageDiagnostics(currentPage, "POST-WARNING DIAGNOSTIC");
 
@@ -510,81 +569,188 @@ async function runJob(job) {
   activeJobs.add(job.taskId);
   send({ type: "started", taskId: job.taskId });
 
+  let frame;
   try {
-    if (!generatorFrame || generatorFrame.isDetached()) {
-      generatorFrame = await locateGeneratorFrame(currentPage, 30_000);
-    }
+    frame = await ensureGeneratorFrame();
 
-    const result = await generatorFrame.evaluate(
-      async (input) => {
+    // Start the generation asynchronously in the frame's Main World (isolatedContext=false)
+    await frame.evaluate(
+      (input) => {
+        const STORE_KEY = Symbol.for("__perchanceNodeTasks");
+        let tasks = globalThis[STORE_KEY];
+        if (!tasks) {
+          tasks = new Map();
+          Object.defineProperty(globalThis, STORE_KEY, {
+            value: tasks,
+            enumerable: false,
+            configurable: false,
+          });
+        }
+
         let api = window.root;
         if (!api) {
           try {
-            api = window.eval("typeof root !== 'undefined' ? root : null");
+            api = (0, eval)("typeof root !== 'undefined' ? root : null");
           } catch {}
         }
-        if (!api) throw new Error("Perchance root API disappeared.");
-
-        if (input.mode === "image") {
-          const generated = await api.generateImage(input.prompt, {
-            resolution: input.resolution,
-          });
-          const dataUrl = generated?.dataUrl;
-          if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) {
-            throw new Error("Perchance image generation returned no image data URL.");
-          }
-          return { response: dataUrl };
+        if (!api) {
+          throw new Error("Perchance root API disappeared.");
         }
 
-        if (input.mode === "text") {
-          let previousFullText = "";
-          let appendCompatible = true;
-          const generated = await api.generateText({
-            instruction: input.prompt,
-            onChunk: (chunkData) => {
-              const fullText =
-                chunkData && typeof chunkData.fullTextSoFar === "string"
-                  ? chunkData.fullTextSoFar
-                  : null;
-              if (fullText === null || !appendCompatible) return;
-              if (!fullText.startsWith(previousFullText)) {
-                appendCompatible = false;
-                return;
+        const record = {
+          chunks: [],
+          done: false,
+          response: null,
+          error: null,
+        };
+        tasks.set(input.taskId, record);
+
+        (async () => {
+          try {
+            if (input.mode === "image") {
+              const opts = input.resolution
+                ? { resolution: input.resolution }
+                : undefined;
+              const generated = await api.generateImage(input.prompt, opts);
+              const dataUrl = generated?.dataUrl;
+              if (
+                typeof dataUrl !== "string" ||
+                !dataUrl.startsWith("data:image/")
+              ) {
+                throw new Error(
+                  "Perchance image generation returned no image data URL."
+                );
               }
-              const delta = fullText.slice(previousFullText.length);
-              previousFullText = fullText;
-              if (delta) {
-                window.__cloudflareEmitChunk({
-                  taskId: input.taskId,
-                  text: delta,
-                });
+              record.response = dataUrl;
+              record.done = true;
+              return;
+            }
+
+            if (input.mode === "text") {
+              let previousFullText = "";
+              let appendCompatible = true;
+              const generated = await api.generateText({
+                instruction: input.prompt,
+                onChunk: (chunkData) => {
+                  const fullText =
+                    chunkData && typeof chunkData.fullTextSoFar === "string"
+                      ? chunkData.fullTextSoFar
+                      : null;
+                  if (fullText === null || !appendCompatible) return;
+                  if (!fullText.startsWith(previousFullText)) {
+                    appendCompatible = false;
+                    return;
+                  }
+                  const delta = fullText.slice(previousFullText.length);
+                  previousFullText = fullText;
+                  if (delta) {
+                    record.chunks.push(delta);
+                  }
+                },
+              });
+              const text =
+                typeof generated === "string" ? generated : generated?.text;
+              if (typeof text !== "string" || !text.length) {
+                throw new Error(
+                  "Perchance text generation returned an empty result."
+                );
               }
-            },
-          });
-          const text = generated?.text;
-          if (typeof text !== "string" || !text.length) {
-            throw new Error("Perchance text generation returned an empty result.");
+              record.response = text;
+              record.done = true;
+              return;
+            }
+
+            throw new Error(`Unsupported job mode: ${input.mode}`);
+          } catch (err) {
+            record.error = err instanceof Error ? err.message : String(err);
+            record.done = true;
           }
-          return { response: text };
-        }
-        throw new Error(`Unsupported job mode: ${input.mode}`);
+        })();
       },
       {
         taskId: job.taskId,
         mode: job.mode,
         prompt: job.prompt,
         resolution: job.resolution,
-      }
+      },
+      false
     );
 
-    if (job.mode === "image" && result.response.length > MAX_IMAGE_DATA_URL_CHARS) {
-      throw new Error("Image result exceeds the configured 6 MB storage safety limit.");
+    const deadline = Date.now() + JOB_TIMEOUT_MS;
+    let finalResponse = null;
+
+    while (true) {
+      if (Date.now() > deadline) {
+        throw new Error(`Job timed out after ${Math.round(JOB_TIMEOUT_MS / 1000)}s.`);
+      }
+      if (!currentPage || currentPage.isClosed() || frame.isDetached()) {
+        throw new Error("Generator frame detached before job completed.");
+      }
+
+      const state = await frame.evaluate(
+        (taskId) => {
+          const tasks = globalThis[Symbol.for("__perchanceNodeTasks")];
+          const record = tasks?.get(taskId);
+          if (!record) return { missing: true };
+
+          const drained = record.chunks.length ? record.chunks.join("") : "";
+          record.chunks.length = 0;
+
+          if (record.done) {
+            tasks.delete(taskId);
+          }
+
+          return {
+            missing: false,
+            chunk: drained,
+            done: record.done,
+            response: record.response,
+            error: record.error,
+          };
+        },
+        job.taskId,
+        false
+      );
+
+      if (state.missing) {
+        throw new Error("Generation task state disappeared (frame navigated/reloaded).");
+      }
+
+      if (state.chunk) {
+        for (let i = 0; i < state.chunk.length; i += MAX_CHUNK_CHARS) {
+          send({
+            type: "chunk",
+            taskId: job.taskId,
+            text: state.chunk.slice(i, i + MAX_CHUNK_CHARS),
+          });
+        }
+      }
+
+      if (state.done) {
+        if (state.error) {
+          throw new Error(state.error);
+        }
+        finalResponse = state.response;
+        break;
+      }
+
+      await new Promise((r) => setTimeout(r, CHUNK_POLL_MS));
+    }
+
+    if (
+      job.mode === "image" &&
+      typeof finalResponse === "string" &&
+      finalResponse.length > MAX_IMAGE_DATA_URL_CHARS
+    ) {
+      throw new Error(
+        "Image result exceeds the configured 6 MB storage safety limit."
+      );
     }
 
     send({
       type: "result",
       taskId: job.taskId,
-      response: result.response,
+      response: finalResponse,
     });
     log("Job completed:", job.taskId, job.mode);
   } catch (error) {
@@ -596,6 +762,17 @@ async function runJob(job) {
       error: message,
     });
   } finally {
+    if (frame && !frame.isDetached()) {
+      await frame
+        .evaluate(
+          (taskId) => {
+            globalThis[Symbol.for("__perchanceNodeTasks")]?.delete(taskId);
+          },
+          job.taskId,
+          false
+        )
+        .catch(() => {});
+    }
     activeJobs.delete(job.taskId);
   }
 }
@@ -613,14 +790,17 @@ function openCloudflareSocket() {
       handshakeTimeout: 30_000,
     });
     socket = ws;
+    lastPongAt = Date.now();
     let settled = false;
 
     ws.on("open", () => {
+      lastPongAt = Date.now();
       log("Connected to Cloudflare; authenticating.");
       ws.send(JSON.stringify({ type: "auth", token: NODE_TOKEN }));
     });
 
     ws.on("message", (buffer) => {
+      lastPongAt = Date.now();
       const raw = buffer.toString();
       if (raw === "pong") return;
 
@@ -634,12 +814,14 @@ function openCloudflareSocket() {
 
       if (message.type === "auth_ok") {
         log("Cloudflare authentication accepted.");
-        ws.send(JSON.stringify({
-          type: "register",
-          nodeId: NODE_ID,
-          textSlots: TEXT_SLOTS,
-          imageSlots: IMAGE_SLOTS,
-        }));
+        ws.send(
+          JSON.stringify({
+            type: "register",
+            nodeId: NODE_ID,
+            textSlots: TEXT_SLOTS,
+            imageSlots: IMAGE_SLOTS,
+          })
+        );
         return;
       }
 
@@ -661,9 +843,11 @@ function openCloudflareSocket() {
         log("Cloudflare error:", message.error);
         if (!settled) {
           settled = true;
-          reject(new Error(
-            `Cloudflare rejected node registration: ${message.error || "unknown error"}`
-          ));
+          reject(
+            new Error(
+              `Cloudflare rejected node registration: ${message.error || "unknown error"}`
+            )
+          );
         }
       }
     });
@@ -702,6 +886,13 @@ async function main() {
       log(`Node online. Capacity: ${TEXT_SLOTS} text + ${IMAGE_SLOTS} image.`);
 
       heartbeat = setInterval(() => {
+        if (Date.now() - lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+          log("Cloudflare WebSocket heartbeat timed out; terminating socket.");
+          try {
+            socket?.terminate();
+          } catch {}
+          return;
+        }
         if (socket?.readyState === WebSocket.OPEN) socket.send("ping");
       }, HEARTBEAT_MS);
 
@@ -725,6 +916,7 @@ async function main() {
       browserContext = null;
       currentPage = null;
       generatorFrame = null;
+      frameRecoveryPromise = null;
       activeJobs.clear();
     }
 
