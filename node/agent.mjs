@@ -1,30 +1,17 @@
 // agent.mjs
 import WebSocket from "ws";
 import crypto from "node:crypto";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
+import path from "node:path";
 import https from "node:https";
 import dns from "node:dns/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { createRequire } from "node:module";
 
-// ============================================================
-// BROWSER ENGINE LOADER (Patchright -> Playwright fallback)
-// ============================================================
-
-async function loadChromiumEngine() {
-  for (const pkg of ["patchright", "playwright", "playwright-core"]) {
-    try {
-      const mod = await import(pkg);
-      if (mod?.chromium) {
-        return { chromium: mod.chromium, engine: pkg };
-      }
-    } catch (error) {
-      if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
-    }
-  }
-  throw new Error(
-    "None of 'patchright', 'playwright', or 'playwright-core' are installed."
-  );
-}
+const execFileAsync = promisify(execFile);
 
 // ============================================================
 // CONFIGURATION
@@ -43,6 +30,7 @@ const ACCEPT_PERCHANCE_WARNING =
   process.env.ACCEPT_PERCHANCE_WARNING === "true";
 const CHROME_CHANNEL = process.env.CHROME_CHANNEL || undefined;
 const CHROME_EXECUTABLE_PATH = process.env.CHROME_EXECUTABLE_PATH || undefined;
+const DISABLE_IPV6 = process.env.DISABLE_IPV6 === "true";
 
 // --- PROXY CONFIGURATION ---
 const PROXY_SERVER = process.env.PROXY_SERVER; // e.g. "http://host:port" or "http://user:pass@host:port"
@@ -72,7 +60,7 @@ if (!Number.isInteger(IMAGE_SLOTS) || IMAGE_SLOTS < 0 || IMAGE_SLOTS > 2) {
   process.exit(1);
 }
 
-let browserEngine = "playwright";
+let browserEngine = "patchright";
 let browserContext;
 let currentPage;
 let generatorFrame;
@@ -104,6 +92,127 @@ function evalMainWorld(frame, fn, arg) {
   return browserEngine === "patchright"
     ? frame.evaluate(fn, arg, false)
     : frame.evaluate(fn, arg);
+}
+
+// ============================================================
+// BROWSER ENGINE LOADER (Auto-installs Patchright if missing)
+// ============================================================
+
+async function loadChromiumEngine() {
+  // 1. Try pre-installed patchright
+  try {
+    const mod = await import("patchright");
+    if (mod?.chromium) {
+      return { chromium: mod.chromium, engine: "patchright", cacheDir: null };
+    }
+  } catch (error) {
+    if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
+  }
+
+  // 2. Auto-install patchright into writable persistent/temp dir
+  const candidates = [
+    path.join(path.dirname(PROFILE_DIR), "patchright-deps"),
+    "/tmp/patchright-deps",
+  ];
+  for (const cacheDir of candidates) {
+    try {
+      await fs.mkdir(cacheDir, { recursive: true });
+      const pkgJsonPath = path.join(cacheDir, "package.json");
+      if (!fsSync.existsSync(pkgJsonPath)) {
+        await fs.writeFile(
+          pkgJsonPath,
+          JSON.stringify({ name: "patchright-runtime", private: true })
+        );
+      }
+
+      const installedMarker = path.join(
+        cacheDir,
+        "node_modules",
+        "patchright",
+        "package.json"
+      );
+      if (!fsSync.existsSync(installedMarker)) {
+        log("Installing 'patchright' into", cacheDir, "...");
+        await execFileAsync(
+          "npm",
+          [
+            "install",
+            "--prefix",
+            cacheDir,
+            "--no-save",
+            "--no-audit",
+            "--no-fund",
+            "patchright",
+          ],
+          { timeout: 180_000 }
+        );
+      }
+
+      const localRequire = createRequire(pkgJsonPath);
+      const mod = localRequire("patchright");
+      if (mod?.chromium) {
+        return { chromium: mod.chromium, engine: "patchright", cacheDir };
+      }
+    } catch (error) {
+      log(
+        "Patchright bootstrap in",
+        cacheDir,
+        "failed:",
+        errorText(error)
+      );
+    }
+  }
+
+  // 3. Last-resort fallback to playwright
+  for (const pkg of ["playwright", "playwright-core"]) {
+    try {
+      const mod = await import(pkg);
+      if (mod?.chromium) {
+        return { chromium: mod.chromium, engine: pkg, cacheDir: null };
+      }
+    } catch (error) {
+      if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
+    }
+  }
+
+  throw new Error("Could not load patchright or playwright.");
+}
+
+async function resolveExecutablePath(chromium, engine, cacheDir) {
+  if (CHROME_EXECUTABLE_PATH) return CHROME_EXECUTABLE_PATH;
+  if (CHROME_CHANNEL) return undefined;
+
+  try {
+    const expected = chromium.executablePath();
+    if (expected && fsSync.existsSync(expected)) return undefined;
+  } catch {}
+
+  if (engine === "patchright" && cacheDir) {
+    const cliPath = path.join(cacheDir, "node_modules", "patchright", "cli.js");
+    if (fsSync.existsSync(cliPath)) {
+      log("Installing Patchright Chromium binary...");
+      try {
+        await execFileAsync(process.execPath, [cliPath, "install", "chromium"], {
+          timeout: 300_000,
+        });
+        const expected = chromium.executablePath();
+        if (expected && fsSync.existsSync(expected)) return undefined;
+      } catch (error) {
+        log("Patchright Chromium install failed:", errorText(error));
+      }
+    }
+  }
+
+  try {
+    const pw = await import("playwright");
+    const pwExec = pw?.chromium?.executablePath?.();
+    if (pwExec && fsSync.existsSync(pwExec)) {
+      log("Reusing existing Chromium binary:", pwExec);
+      return pwExec;
+    }
+  } catch {}
+
+  return undefined;
 }
 
 function buildProxyConfig() {
@@ -521,14 +630,15 @@ async function ensureGeneratorFrame() {
 }
 
 // ============================================================
-// START CHROMIUM UNDER XVFB
+// START STEALTH CHROMIUM UNDER XVFB
 // ============================================================
 
 async function startBrowser() {
   await fs.mkdir(PROFILE_DIR, { recursive: true });
 
-  const { chromium, engine } = await loadChromiumEngine();
+  const { chromium, engine, cacheDir } = await loadChromiumEngine();
   browserEngine = engine;
+  const executablePath = await resolveExecutablePath(chromium, engine, cacheDir);
 
   const proxyConfig = buildProxyConfig();
   if (proxyConfig) {
@@ -545,15 +655,17 @@ async function startBrowser() {
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--window-size=1365,900",
-    "--disable-ipv6",
   ];
+  if (DISABLE_IPV6) {
+    launchArgs.push("--disable-ipv6");
+  }
   if (engine !== "patchright") {
     launchArgs.push("--disable-blink-features=AutomationControlled");
   }
 
   browserContext = await chromium.launchPersistentContext(PROFILE_DIR, {
     ...(CHROME_CHANNEL ? { channel: CHROME_CHANNEL } : {}),
-    ...(CHROME_EXECUTABLE_PATH ? { executablePath: CHROME_EXECUTABLE_PATH } : {}),
+    ...(executablePath ? { executablePath } : {}),
     headless: false,
     viewport: null,
     proxy: proxyConfig,
