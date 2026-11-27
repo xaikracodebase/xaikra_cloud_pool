@@ -155,7 +155,7 @@ async function startBrowser() {
   log("Launching headless Chromium with persistent profile", PROFILE_DIR);
 
   browserContext = await chromium.launchPersistentContext(PROFILE_DIR, {
-    headless: true,
+    headless: false,
     viewport: { width: 1365, height: 900 },
     locale: "en-US",
     args: [
