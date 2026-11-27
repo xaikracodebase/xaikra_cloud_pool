@@ -1,5 +1,5 @@
-
-import { chromium } from "playwright";
+// node.js
+import { chromium } from "patchright"; // <-- Swapped from "playwright"
 import WebSocket from "ws";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -21,6 +21,14 @@ const TEXT_SLOTS = Number.parseInt(process.env.TEXT_SLOTS || "2", 10);
 const IMAGE_SLOTS = Number.parseInt(process.env.IMAGE_SLOTS || "1", 10);
 const ACCEPT_PERCHANCE_WARNING =
   process.env.ACCEPT_PERCHANCE_WARNING === "true";
+
+// --- PROXY CONFIGURATION ---
+// A residential proxy is the most reliable way to bypass the network-level
+// block on *.challenges.cloudflare.com from datacenter IPs, and it also
+// improves IP reputation for Cloudflare's bot scoring.
+const PROXY_SERVER = process.env.PROXY_SERVER; // "http://host:port"
+const PROXY_USERNAME = process.env.PROXY_USERNAME;
+const PROXY_PASSWORD = process.env.PROXY_PASSWORD;
 
 const HEARTBEAT_MS = 25_000;
 const API_DISCOVERY_TIMEOUT_MS = 180_000;
@@ -69,10 +77,6 @@ function send(message) {
 // ============================================================
 // OUTBOUND IPv4 CONNECTIVITY DIAGNOSTICS
 // ============================================================
-// This diagnostic does not bypass verification. It tests whether
-// the challenge hostname can be reached via candidate IPv4 edges,
-// preserving TLS SNI and the HTTP Host header for the original host.
-// ============================================================
 
 async function testHttpsAtIPv4(hostname, ip) {
   return new Promise((resolve) => {
@@ -87,8 +91,6 @@ async function testHttpsAtIPv4(hostname, ip) {
 
     const req = https.get(
       {
-        // Connect directly to the IPv4 address. Keep the original
-        // hostname in SNI and Host so TLS/HTTP target the same host.
         hostname: ip,
         servername: hostname,
         path: "/",
@@ -137,9 +139,6 @@ async function testHttpsAtIPv4(hostname, ip) {
 
 async function networkDiagnostics() {
   const hostname = "brunhild.challenges.cloudflare.com";
-  // Candidate IPv4 values inferred from the IPv6 values reported
-  // by this container. They are tested as candidates, not assumed
-  // to be authoritative DNS A records for this hostname.
   const candidateIPv4 = ["104.18.16.146", "104.18.17.146"];
 
   log("========== FORCED IPV4 CONNECTIVITY TEST BEGIN ==========");
@@ -429,21 +428,40 @@ async function locateGeneratorFrame(page, timeoutMs = API_DISCOVERY_TIMEOUT_MS) 
 }
 
 // ============================================================
-// START HEADED CHROMIUM UNDER XVFB
+// START STEALTH CHROMIUM (Patchright) UNDER XVFB
 // ============================================================
 
 async function startBrowser() {
   await fs.mkdir(PROFILE_DIR, { recursive: true });
-  log("Launching headed Chromium under Xvfb with persistent profile", PROFILE_DIR);
+
+  // Build proxy configuration if provided
+  let proxyConfig;
+  if (PROXY_SERVER) {
+    proxyConfig = { server: PROXY_SERVER };
+    if (PROXY_USERNAME) proxyConfig.username = PROXY_USERNAME;
+    if (PROXY_PASSWORD) proxyConfig.password = PROXY_PASSWORD;
+    log("Launching headed Patchright Chromium with proxy", PROXY_SERVER);
+  } else {
+    log("Launching headed Patchright Chromium WITHOUT proxy (network may still block challenges)");
+  }
+  log("Profile directory:", PROFILE_DIR);
 
   browserContext = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: false,
     viewport: { width: 1365, height: 900 },
     locale: "en-US",
+    proxy: proxyConfig,
     args: [
       "--no-sandbox",
+      "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
+      // Force IPv4 to work around broken IPv6 routes in container networks.
+      "--disable-ipv6",
+      // Reduce automation tells at the browser level.
+      "--disable-blink-features=AutomationControlled",
+      // Helpful stability on xvfb / containers
+      "--disable-features=IsolateOrigins,site-per-process",
     ],
   });
 
@@ -482,8 +500,6 @@ async function startBrowser() {
 
 // ============================================================
 // GENERATION JOB HANDLER
-// Cloudflare Worker protocol: job {taskId, mode, prompt, resolution};
-// node responds with started, chunk, result, or error.
 // ============================================================
 
 async function runJob(job) {
