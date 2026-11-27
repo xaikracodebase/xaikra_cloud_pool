@@ -1,11 +1,30 @@
-// node.js
-import { chromium } from "patchright";
+// agent.mjs
 import WebSocket from "ws";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import https from "node:https";
 import dns from "node:dns/promises";
+
+// ============================================================
+// BROWSER ENGINE LOADER (Patchright -> Playwright fallback)
+// ============================================================
+
+async function loadChromiumEngine() {
+  for (const pkg of ["patchright", "playwright", "playwright-core"]) {
+    try {
+      const mod = await import(pkg);
+      if (mod?.chromium) {
+        return { chromium: mod.chromium, engine: pkg };
+      }
+    } catch (error) {
+      if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
+    }
+  }
+  throw new Error(
+    "None of 'patchright', 'playwright', or 'playwright-core' are installed."
+  );
+}
 
 // ============================================================
 // CONFIGURATION
@@ -23,6 +42,7 @@ const IMAGE_SLOTS = Number.parseInt(process.env.IMAGE_SLOTS || "1", 10);
 const ACCEPT_PERCHANCE_WARNING =
   process.env.ACCEPT_PERCHANCE_WARNING === "true";
 const CHROME_CHANNEL = process.env.CHROME_CHANNEL || undefined;
+const CHROME_EXECUTABLE_PATH = process.env.CHROME_EXECUTABLE_PATH || undefined;
 
 // --- PROXY CONFIGURATION ---
 const PROXY_SERVER = process.env.PROXY_SERVER; // e.g. "http://host:port" or "http://user:pass@host:port"
@@ -52,6 +72,7 @@ if (!Number.isInteger(IMAGE_SLOTS) || IMAGE_SLOTS < 0 || IMAGE_SLOTS > 2) {
   process.exit(1);
 }
 
+let browserEngine = "playwright";
 let browserContext;
 let currentPage;
 let generatorFrame;
@@ -77,6 +98,12 @@ function send(message) {
     log("WebSocket send failed:", errorText(error));
     return false;
   }
+}
+
+function evalMainWorld(frame, fn, arg) {
+  return browserEngine === "patchright"
+    ? frame.evaluate(fn, arg, false)
+    : frame.evaluate(fn, arg);
 }
 
 function buildProxyConfig() {
@@ -301,28 +328,23 @@ async function dumpPageDiagnostics(page, label) {
 
   for (const [index, frame] of page.frames().entries()) {
     try {
-      // Patchright defaults evaluate() to isolatedContext=true; pass false to inspect main-world root.
-      const details = await frame.evaluate(
-        () => {
-          let api = window.root;
-          if (!api) {
-            try {
-              api = (0, eval)("typeof root !== 'undefined' ? root : null");
-            } catch {}
-          }
-          return {
-            url: location.href,
-            title: document.title,
-            readyState: document.readyState,
-            rootType: typeof api,
-            generateText: typeof api?.generateText,
-            generateImage: typeof api?.generateImage,
-            bodyText: document.body?.innerText?.slice(0, 700) || "",
-          };
-        },
-        undefined,
-        false
-      );
+      const details = await evalMainWorld(frame, () => {
+        let api = window.root;
+        if (!api) {
+          try {
+            api = (0, eval)("typeof root !== 'undefined' ? root : null");
+          } catch {}
+        }
+        return {
+          url: location.href,
+          title: document.title,
+          readyState: document.readyState,
+          rootType: typeof api,
+          generateText: typeof api?.generateText,
+          generateImage: typeof api?.generateImage,
+          bodyText: document.body?.innerText?.slice(0, 700) || "",
+        };
+      });
       log(`[FRAME SNAPSHOT ${index}]`, JSON.stringify(details));
     } catch (error) {
       log(`[FRAME SNAPSHOT ${index} FAILED]`, frame.url(), errorText(error));
@@ -401,32 +423,26 @@ async function continuePastPerchanceWarning(page, timeoutMs = 10_000) {
 // ============================================================
 
 async function inspectFrameForGenerator(frame) {
-  // IMPORTANT (Patchright): pass isolatedContext=false (3rd arg) so we run in the
-  // frame's Main World where Perchance defines `root` / `window.root`.
-  return frame.evaluate(
-    () => {
-      let api = window.root;
-      if (!api) {
-        try {
-          api = (0, eval)("typeof root !== 'undefined' ? root : null");
-        } catch {}
-      }
-      return {
-        url: location.href,
-        title: document.title,
-        readyState: document.readyState,
-        rootType: typeof api,
-        generateText: typeof api?.generateText,
-        generateImage: typeof api?.generateImage,
-        bodyText: document.body?.innerText?.slice(0, 500) || "",
-        hasGeneratorApi:
-          typeof api?.generateText === "function" &&
-          typeof api?.generateImage === "function",
-      };
-    },
-    undefined,
-    false
-  );
+  return evalMainWorld(frame, () => {
+    let api = window.root;
+    if (!api) {
+      try {
+        api = (0, eval)("typeof root !== 'undefined' ? root : null");
+      } catch {}
+    }
+    return {
+      url: location.href,
+      title: document.title,
+      readyState: document.readyState,
+      rootType: typeof api,
+      generateText: typeof api?.generateText,
+      generateImage: typeof api?.generateImage,
+      bodyText: document.body?.innerText?.slice(0, 500) || "",
+      hasGeneratorApi:
+        typeof api?.generateText === "function" &&
+        typeof api?.generateImage === "function",
+    };
+  });
 }
 
 async function locateGeneratorFrame(page, timeoutMs = API_DISCOVERY_TIMEOUT_MS) {
@@ -444,7 +460,6 @@ async function locateGeneratorFrame(page, timeoutMs = API_DISCOVERY_TIMEOUT_MS) 
       } catch {}
     }
 
-    // Handle warnings that appear late (e.g. after Cloudflare challenge or slow proxy).
     const lateWarning = await findPerchanceWarningAction(page, 0);
     if (lateWarning) {
       await acceptWarningAction(page, lateWarning);
@@ -506,42 +521,53 @@ async function ensureGeneratorFrame() {
 }
 
 // ============================================================
-// START STEALTH CHROMIUM (Patchright) UNDER XVFB
+// START CHROMIUM UNDER XVFB
 // ============================================================
 
 async function startBrowser() {
   await fs.mkdir(PROFILE_DIR, { recursive: true });
 
+  const { chromium, engine } = await loadChromiumEngine();
+  browserEngine = engine;
+
   const proxyConfig = buildProxyConfig();
   if (proxyConfig) {
-    log("Launching headed Patchright Chromium with proxy", proxyConfig.server);
+    log(`Launching headed ${engine} Chromium with proxy`, proxyConfig.server);
   } else {
-    log("Launching headed Patchright Chromium WITHOUT proxy (network may still block challenges)");
+    log(
+      `Launching headed ${engine} Chromium WITHOUT proxy (network may still block challenges)`
+    );
   }
   log("Profile directory:", PROFILE_DIR);
 
+  const launchArgs = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--window-size=1365,900",
+    "--disable-ipv6",
+  ];
+  if (engine !== "patchright") {
+    launchArgs.push("--disable-blink-features=AutomationControlled");
+  }
+
   browserContext = await chromium.launchPersistentContext(PROFILE_DIR, {
     ...(CHROME_CHANNEL ? { channel: CHROME_CHANNEL } : {}),
+    ...(CHROME_EXECUTABLE_PATH ? { executablePath: CHROME_EXECUTABLE_PATH } : {}),
     headless: false,
     viewport: null,
     proxy: proxyConfig,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--window-size=1365,900",
-      // Force IPv4 to work around broken IPv6 routes in container networks.
-      "--disable-ipv6",
-    ],
+    args: launchArgs,
   });
+
+  if (engine !== "patchright") {
+    await browserContext.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    });
+  }
 
   currentPage = browserContext.pages()[0] || (await browserContext.newPage());
   attachPageDiagnostics(currentPage);
-
-  // NOTE: Do NOT use currentPage.exposeFunction() in Patchright!
-  // Patchright's exposeFunction installs a global "**/*" Fetch route interceptor
-  // to inject bindings, which degrades stealth and interferes with Cloudflare/iframe docs.
-  // Instead, streaming chunks are polled directly from the frame's Main World.
 
   await currentPage.goto(PERCHANCE_URL, {
     waitUntil: "domcontentloaded",
@@ -573,8 +599,8 @@ async function runJob(job) {
   try {
     frame = await ensureGeneratorFrame();
 
-    // Start the generation asynchronously in the frame's Main World (isolatedContext=false)
-    await frame.evaluate(
+    await evalMainWorld(
+      frame,
       (input) => {
         const STORE_KEY = Symbol.for("__perchanceNodeTasks");
         let tasks = globalThis[STORE_KEY];
@@ -672,8 +698,7 @@ async function runJob(job) {
         mode: job.mode,
         prompt: job.prompt,
         resolution: job.resolution,
-      },
-      false
+      }
     );
 
     const deadline = Date.now() + JOB_TIMEOUT_MS;
@@ -687,7 +712,8 @@ async function runJob(job) {
         throw new Error("Generator frame detached before job completed.");
       }
 
-      const state = await frame.evaluate(
+      const state = await evalMainWorld(
+        frame,
         (taskId) => {
           const tasks = globalThis[Symbol.for("__perchanceNodeTasks")];
           const record = tasks?.get(taskId);
@@ -708,8 +734,7 @@ async function runJob(job) {
             error: record.error,
           };
         },
-        job.taskId,
-        false
+        job.taskId
       );
 
       if (state.missing) {
@@ -763,15 +788,13 @@ async function runJob(job) {
     });
   } finally {
     if (frame && !frame.isDetached()) {
-      await frame
-        .evaluate(
-          (taskId) => {
-            globalThis[Symbol.for("__perchanceNodeTasks")]?.delete(taskId);
-          },
-          job.taskId,
-          false
-        )
-        .catch(() => {});
+      await evalMainWorld(
+        frame,
+        (taskId) => {
+          globalThis[Symbol.for("__perchanceNodeTasks")]?.delete(taskId);
+        },
+        job.taskId
+      ).catch(() => {});
     }
     activeJobs.delete(job.taskId);
   }
