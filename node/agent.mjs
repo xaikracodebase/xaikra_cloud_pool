@@ -12,26 +12,19 @@ import dns from "node:dns/promises";
 
 const PERCHANCE_URL =
   process.env.PERCHANCE_URL || "https://perchance.org/fu677q3rr4";
-
 const CF_WS_URL = process.env.CF_WS_URL;
 const NODE_TOKEN = process.env.NODE_TOKEN;
-
 const NODE_ID =
-  process.env.NODE_ID ||
-  `${os.hostname()}-${crypto.randomUUID().slice(0, 8)}`;
-
+  process.env.NODE_ID || `${os.hostname()}-${crypto.randomUUID().slice(0, 8)}`;
 const PROFILE_DIR = process.env.PROFILE_DIR || "/data/profile";
-
 const TEXT_SLOTS = Number.parseInt(process.env.TEXT_SLOTS || "2", 10);
 const IMAGE_SLOTS = Number.parseInt(process.env.IMAGE_SLOTS || "1", 10);
-
 const ACCEPT_PERCHANCE_WARNING =
   process.env.ACCEPT_PERCHANCE_WARNING === "true";
 
 const HEARTBEAT_MS = 25_000;
 const API_DISCOVERY_TIMEOUT_MS = 180_000;
 const MAX_IMAGE_DATA_URL_CHARS = 6_000_000;
-
 const WARNING_ACTION_RE =
   /(?:continue\s+to\s+page|i['’]?m\s+over\s+18.*show\s+content)/i;
 
@@ -44,7 +37,6 @@ if (!Number.isInteger(TEXT_SLOTS) || TEXT_SLOTS < 0 || TEXT_SLOTS > 4) {
   console.error("TEXT_SLOTS must be an integer from 0 to 4.");
   process.exit(1);
 }
-
 if (!Number.isInteger(IMAGE_SLOTS) || IMAGE_SLOTS < 0 || IMAGE_SLOTS > 2) {
   console.error("IMAGE_SLOTS must be an integer from 0 to 2.");
   process.exit(1);
@@ -54,7 +46,6 @@ let browserContext;
 let currentPage;
 let generatorFrame;
 let socket;
-
 const activeJobs = new Set();
 
 function log(...args) {
@@ -67,7 +58,6 @@ function errorText(error) {
 
 function send(message) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-
   try {
     socket.send(JSON.stringify(message));
     return true;
@@ -78,28 +68,48 @@ function send(message) {
 }
 
 // ============================================================
-// OUTBOUND NETWORK DIAGNOSTICS
+// OUTBOUND IPV4 CONNECTIVITY DIAGNOSTICS
 // ============================================================
 
 async function networkDiagnostics() {
-  const hosts = [
-    "perchance.org",
-    "challenges.cloudflare.com",
-    "brunhild.challenges.cloudflare.com"
+  const hostname = "brunhild.challenges.cloudflare.com";
+
+  const candidateIPv4 = [
+    "104.18.16.146",
+    "104.18.17.146",
   ];
 
-  log("========== OUTBOUND NETWORK DIAGNOSTICS BEGIN ==========");
+  log("========== FORCED IPV4 CONNECTIVITY TEST BEGIN ==========");
 
-  for (const hostname of hosts) {
-    try {
-      const addresses = await dns.lookup(hostname, { all: true });
-      log("[DNS SUCCESS]", hostname, JSON.stringify(addresses));
-    } catch (error) {
-      log("[DNS FAILED]", hostname, error.code || errorText(error));
-      continue;
-    }
+  let actualIPv4 = [];
 
-    await new Promise(resolve => {
+  try {
+    actualIPv4 = await dns.resolve4(hostname);
+
+    log(
+      "[ACTUAL IPV4 DNS RECORDS]",
+      hostname,
+      JSON.stringify(actualIPv4)
+    );
+  } catch (error) {
+    log(
+      "[NO IPV4 DNS RECORDS]",
+      hostname,
+      error.code || errorText(error)
+    );
+  }
+
+  // Test actual A records first, then candidate IPv4 endpoints
+  // inferred from the IPv6 addresses observed previously.
+  const targets = [
+    ...new Set([
+      ...actualIPv4,
+      ...candidateIPv4
+    ])
+  ];
+
+  for (const ip of targets) {
+    await new Promise((resolve) => {
       let settled = false;
 
       const finish = () => {
@@ -108,51 +118,68 @@ async function networkDiagnostics() {
         resolve();
       };
 
-      const request = https.get({
-        hostname,
-        path: "/",
-        timeout: 8000,
-        headers: {
-          "User-Agent": "PerchanceNode-Network-Diagnostic/1.0"
-        }
-      }, response => {
-        log(
-          "[HTTPS RESULT]",
+      log("[TESTING IPV4]", hostname, "via", ip);
+
+      const request = https.get(
+        {
           hostname,
-          "HTTP",
-          response.statusCode,
-          "remoteAddress=",
-          response.socket?.remoteAddress || "unknown"
-        );
+          servername: hostname,
+          path: "/",
+          timeout: 10_000,
 
-        response.resume();
-        response.on("end", finish);
+          lookup: (_lookupHostname, _options, callback) => {
+            callback(null, ip, 4);
+          },
 
-        response.on("error", error => {
-          log("[HTTPS RESPONSE ERROR]", hostname, error.code || errorText(error));
-          finish();
-        });
+          headers: {
+            "User-Agent": "PerchanceNode-Network-Diagnostic/1.0",
+          },
+        },
+        (response) => {
+          log(
+            "[FORCED IPV4 RESULT]",
+            ip,
+            "HTTP",
+            response.statusCode,
+            "remoteAddress=",
+            response.socket?.remoteAddress || "unknown"
+          );
 
-        response.setTimeout(2000, () => {
-          response.destroy();
-          finish();
-        });
-      });
+          response.resume();
+
+          response.on("end", finish);
+
+          response.on("error", (error) => {
+            log(
+              "[FORCED IPV4 RESPONSE ERROR]",
+              ip,
+              error.code || errorText(error)
+            );
+
+            finish();
+          });
+        }
+      );
 
       request.on("timeout", () => {
-        log("[HTTPS TIMEOUT]", hostname);
+        log("[FORCED IPV4 TIMEOUT]", ip);
         request.destroy();
         finish();
       });
 
-      request.on("error", error => {
-        log("[HTTPS ERROR]", hostname, error.code || errorText(error));
+      request.on("error", (error) => {
+        log(
+          "[FORCED IPV4 ERROR]",
+          ip,
+          error.code || errorText(error)
+        );
+
         finish();
       });
     });
   }
 
-  log("========== OUTBOUND NETWORK DIAGNOSTICS END ==========");
+  log("========== FORCED IPV4 CONNECTIVITY TEST END ==========");
 }
 
 // ============================================================
@@ -160,7 +187,7 @@ async function networkDiagnostics() {
 // ============================================================
 
 function attachPageDiagnostics(page) {
-  page.on("request", request => {
+  page.on("request", (request) => {
     try {
       if (
         request.isNavigationRequest() &&
@@ -182,7 +209,7 @@ function attachPageDiagnostics(page) {
     } catch {}
   });
 
-  page.on("requestfailed", request => {
+  page.on("requestfailed", (request) => {
     let frameUrl = "unknown";
 
     try {
@@ -205,7 +232,7 @@ function attachPageDiagnostics(page) {
     );
   });
 
-  page.on("response", response => {
+  page.on("response", (response) => {
     if (response.status() < 400) return;
 
     const request = response.request();
@@ -223,31 +250,37 @@ function attachPageDiagnostics(page) {
     }
   });
 
-  page.on("console", message => {
+  page.on("console", (message) => {
     if (message.type() === "error") {
       log("[BROWSER CONSOLE ERROR]", message.text());
     }
   });
 
-  page.on("pageerror", error => {
+  page.on("pageerror", (error) => {
     log("[PAGE JAVASCRIPT ERROR]", errorText(error));
   });
 
-  page.on("frameattached", frame => {
+  page.on("frameattached", (frame) => {
     log("[FRAME ATTACHED]", frame.url() || "<pending URL>");
   });
 
-  page.on("framenavigated", frame => {
+  page.on("framenavigated", (frame) => {
     let frameName = "";
 
     try {
       frameName = frame.name();
     } catch {}
 
-    log("[FRAME NAVIGATED]", "name=", frameName, "url=", frame.url());
+    log(
+      "[FRAME NAVIGATED]",
+      "name=",
+      frameName,
+      "url=",
+      frame.url()
+    );
   });
 
-  page.on("framedetached", frame => {
+  page.on("framedetached", (frame) => {
     let oldUrl = "unknown";
 
     try {
@@ -276,17 +309,18 @@ async function dumpPageDiagnostics(page, label) {
       readyState: document.readyState,
       bodyText: document.body?.innerText?.slice(0, 1200) || "",
 
-      iframes: Array.from(document.querySelectorAll("iframe")).map(frame => ({
+      iframes: Array.from(document.querySelectorAll("iframe")).map((frame) => ({
         srcAttribute: frame.getAttribute("src"),
         resolvedSrc: frame.src,
         title: frame.title,
         name: frame.name,
         id: frame.id,
-        sandbox: frame.getAttribute("sandbox")
-      }))
+        sandbox: frame.getAttribute("sandbox"),
+      })),
     }));
 
     log("[PAGE SNAPSHOT]", JSON.stringify(pageInfo));
+
   } catch (error) {
     log("[PAGE SNAPSHOT FAILED]", errorText(error));
   }
@@ -300,12 +334,17 @@ async function dumpPageDiagnostics(page, label) {
         rootType: typeof window.root,
         generateText: typeof window.root?.generateText,
         generateImage: typeof window.root?.generateImage,
-        bodyText: document.body?.innerText?.slice(0, 700) || ""
+        bodyText: document.body?.innerText?.slice(0, 700) || "",
       }));
 
       log(`[FRAME SNAPSHOT ${index}]`, JSON.stringify(details));
+
     } catch (error) {
-      log(`[FRAME SNAPSHOT ${index} FAILED]`, frame.url(), errorText(error));
+      log(
+        `[FRAME SNAPSHOT ${index} FAILED]`,
+        frame.url(),
+        errorText(error)
+      );
     }
   }
 
@@ -332,11 +371,11 @@ async function findPerchanceWarningAction(page, timeoutMs = 10_000) {
           }).first(),
 
           frame.getByRole("button", {
-            name: /i['’]?m\s+over\s+18.*show\s+content/i
+            name: /i['’]?m\s+over\s+18.*show\s+content/i,
           }).first(),
 
           frame.getByRole("link", {
-            name: /i['’]?m\s+over\s+18.*show\s+content/i
+            name: /i['’]?m\s+over\s+18.*show\s+content/i,
           }).first(),
 
           frame.locator("button, a, [role='button']")
@@ -347,7 +386,7 @@ async function findPerchanceWarningAction(page, timeoutMs = 10_000) {
 
           frame.getByText(
             /i['’]?m\s+over\s+18.*show\s+content/i
-          ).first()
+          ).first(),
         ];
 
         for (const candidate of candidates) {
@@ -390,7 +429,9 @@ async function continuePastPerchanceWarning(page) {
 
   log("Perchance continuation warning detected; clicking the visible confirmation.");
 
-  await action.locator.click({ timeout: 15_000 });
+  await action.locator.click({
+    timeout: 15_000
+  });
 
   await page.waitForTimeout(2_000);
 
@@ -446,7 +487,9 @@ async function locateGeneratorFrame(
           log("[GENERATOR API FOUND]", JSON.stringify(info));
           return frame;
         }
-      } catch {}
+      } catch {
+        // A frame can be navigating or detached.
+      }
     }
 
     if (Date.now() >= nextDiagnosticAt) {
@@ -454,7 +497,9 @@ async function locateGeneratorFrame(
 
       for (const frame of page.frames()) {
         try {
-          frameSummary.push(await inspectFrameForGenerator(frame));
+          frameSummary.push(
+            await inspectFrameForGenerator(frame)
+          );
         } catch (error) {
           frameSummary.push({
             url: frame.url(),
@@ -463,12 +508,17 @@ async function locateGeneratorFrame(
         }
       }
 
-      log("[GENERATOR SEARCH SNAPSHOT]", JSON.stringify(frameSummary));
+      log(
+        "[GENERATOR SEARCH SNAPSHOT]",
+        JSON.stringify(frameSummary)
+      );
 
-      if (frameSummary.some(f =>
-        typeof f.url === "string" &&
-        f.url.includes("challenges.cloudflare.com")
-      )) {
+      if (
+        frameSummary.some((f) =>
+          typeof f.url === "string" &&
+          f.url.includes("challenges.cloudflare.com")
+        )
+      ) {
         log(
           "[VERIFICATION NOTICE] A Cloudflare verification frame is present. " +
           "This node does not solve or bypass verification. Use an approved " +
@@ -482,7 +532,10 @@ async function locateGeneratorFrame(
     await page.waitForTimeout(1_000).catch(() => {});
   }
 
-  await dumpPageDiagnostics(page, "GENERATOR API DISCOVERY TIMEOUT");
+  await dumpPageDiagnostics(
+    page,
+    "GENERATOR API DISCOVERY TIMEOUT"
+  );
 
   throw new Error(
     "Could not find root.generateText/root.generateImage within " +
@@ -496,7 +549,9 @@ async function locateGeneratorFrame(
 // ============================================================
 
 async function startBrowser() {
-  await fs.mkdir(PROFILE_DIR, { recursive: true });
+  await fs.mkdir(PROFILE_DIR, {
+    recursive: true
+  });
 
   log(
     "Launching headed Chromium under Xvfb with persistent profile",
@@ -529,22 +584,25 @@ async function startBrowser() {
 
   attachPageDiagnostics(currentPage);
 
-  await currentPage.exposeFunction("__cloudflareEmitChunk", payload => {
-    if (
-      !payload ||
-      typeof payload.taskId !== "string" ||
-      typeof payload.text !== "string" ||
-      payload.text.length > 64_000
-    ) {
-      return;
-    }
+  await currentPage.exposeFunction(
+    "__cloudflareEmitChunk",
+    (payload) => {
+      if (
+        !payload ||
+        typeof payload.taskId !== "string" ||
+        typeof payload.text !== "string" ||
+        payload.text.length > 64_000
+      ) {
+        return;
+      }
 
-    send({
-      type: "chunk",
-      taskId: payload.taskId,
-      text: payload.text
-    });
-  });
+      send({
+        type: "chunk",
+        taskId: payload.taskId,
+        text: payload.text
+      });
+    }
+  );
 
   await currentPage.goto(PERCHANCE_URL, {
     waitUntil: "domcontentloaded",
@@ -602,7 +660,7 @@ async function runJob(job) {
     }
 
     const result = await generatorFrame.evaluate(
-      async input => {
+      async (input) => {
         let api = window.root;
 
         if (!api) {
@@ -614,7 +672,9 @@ async function runJob(job) {
         }
 
         if (!api) {
-          throw new Error("Perchance root API disappeared.");
+          throw new Error(
+            "Perchance root API disappeared."
+          );
         }
 
         // IMAGE GENERATION
@@ -650,7 +710,7 @@ async function runJob(job) {
           const generated = await api.generateText({
             instruction: input.prompt,
 
-            onChunk: chunkData => {
+            onChunk: (chunkData) => {
               const fullText =
                 chunkData &&
                 typeof chunkData.fullTextSoFar === "string"
@@ -664,12 +724,17 @@ async function runJob(job) {
                 return;
               }
 
-              if (!fullText.startsWith(previousFullText)) {
+              if (
+                !fullText.startsWith(previousFullText)
+              ) {
                 appendCompatible = false;
                 return;
               }
 
-              const delta = fullText.slice(previousFullText.length);
+              const delta = fullText.slice(
+                previousFullText.length
+              );
+
               previousFullText = fullText;
 
               if (delta) {
@@ -714,7 +779,7 @@ async function runJob(job) {
       result.response.length > MAX_IMAGE_DATA_URL_CHARS
     ) {
       throw new Error(
-        "Image result exceeds the configured 6 MB limit."
+        "Image result exceeds the configured 6 MB Cloudflare storage limit."
       );
     }
 
@@ -724,12 +789,20 @@ async function runJob(job) {
       response: result.response
     });
 
-    log("Job completed:", job.taskId, job.mode);
+    log(
+      "Job completed:",
+      job.taskId,
+      job.mode
+    );
 
   } catch (error) {
     const message = errorText(error);
 
-    log("Job failed:", job.taskId, message);
+    log(
+      "Job failed:",
+      job.taskId,
+      message
+    );
 
     send({
       type: "error",
@@ -772,7 +845,7 @@ function openCloudflareSocket() {
       }));
     });
 
-    ws.on("message", buffer => {
+    ws.on("message", (buffer) => {
       const raw = buffer.toString();
 
       if (raw === "pong") return;
@@ -800,7 +873,10 @@ function openCloudflareSocket() {
       }
 
       if (message.type === "node_ready") {
-        log("Registered with Cloudflare:", message);
+        log(
+          "Registered with Cloudflare:",
+          message
+        );
 
         if (!settled) {
           settled = true;
@@ -850,7 +926,7 @@ function openCloudflareSocket() {
       }
     });
 
-    ws.on("error", error => {
+    ws.on("error", (error) => {
       log("WebSocket error:", error.message);
 
       if (!settled) {
@@ -886,14 +962,17 @@ async function main() {
         }
       }, HEARTBEAT_MS);
 
-      await new Promise(resolve => {
+      await new Promise((resolve) => {
         socket.once("close", resolve);
         currentPage.once("close", resolve);
         currentPage.once("crash", resolve);
       });
 
     } catch (error) {
-      log("Node cycle ended:", errorText(error));
+      log(
+        "Node cycle ended:",
+        errorText(error)
+      );
 
     } finally {
       if (heartbeat) {
@@ -916,9 +995,13 @@ async function main() {
       activeJobs.clear();
     }
 
-    log("Restarting browser/node connection in 5 seconds.");
+    log(
+      "Restarting browser/node connection in 5 seconds."
+    );
 
-    await new Promise(resolve => setTimeout(resolve, 5_000));
+    await new Promise((resolve) =>
+      setTimeout(resolve, 5_000)
+    );
   }
 }
 
@@ -940,7 +1023,7 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-main().catch(error => {
+main().catch((error) => {
   log("Fatal node error:", errorText(error));
   process.exit(1);
 });
